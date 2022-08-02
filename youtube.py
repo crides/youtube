@@ -1,12 +1,15 @@
 #!/usr/bin/python3
 
-import json, os, time
+import json, os, time, asyncio, aiohttp, async_timeout, pprint
 
 CONFIG_DIR = f"{os.environ['HOME']}/.config/youtube/"
 QUEUE_FILE = f"{CONFIG_DIR}youtube.json"
 
 def dump_queue(Q):
-    json.dump(Q, open(QUEUE_FILE, "w"), indent=2)
+    with open(QUEUE_FILE, "w") as out:
+        json.dump(Q, out, indent=2)
+        out.flush()
+        os.fsync(out.fileno())
 
 def read_queue():
     return json.load(open(QUEUE_FILE))
@@ -15,9 +18,15 @@ def get_subs():
     import json
     return json.load(open(f"{CONFIG_DIR}subs.json"))
 
-def get_vids_from_sub(sub, from_time):
+async def fetch(session, url):
+    async with async_timeout.timeout(5):
+        async with await session.get(url) as resp:
+            return await resp.text()
+
+async def get_vids_from_sub(session, sub, from_time):
     import feedparser, time, html
-    feed = feedparser.parse(sub["url"])
+    url = "https://www.youtube.com/feeds/videos.xml?channel_id=" + sub["id"]
+    feed = feedparser.parse(await fetch(session, url))
     new_vids = []
     for entry in feed.entries:
         try:
@@ -26,17 +35,16 @@ def get_vids_from_sub(sub, from_time):
             unix_time = time.time()
         if unix_time > from_time:
             new_vids.append({
-                "channel": entry["author"],
+                "channel": sub["name"],
                 "title": html.unescape(entry["title"]),
                 "link": entry["link"],
                 "unix_time": unix_time,
             })
     return new_vids
 
-def get_duration(url):
+async def get_duration(session, url):
     # Naive processing without BS
-    from urllib import request
-    body = request.urlopen(url).read().decode("utf8")
+    body = await fetch(session, url)
     lines = body.split("\n")
     for line in lines:
         prop_ind = line.find('itemprop="duration"')
@@ -55,11 +63,10 @@ def parse_time(s):
     time = int(time[0]) * 60 + int(time[1])
     return time
 
-def get_info(url):
+async def get_info(session, url):
     # Naive processing without BS
-    from urllib import request
     import re, html
-    body = request.urlopen(url).read().decode("utf8")
+    body = (await fetch(session, url)).read().decode("utf8")
     lines = body.split("\n")
     for line in lines:
         prop_ind = line.find('itemprop="duration"')
@@ -79,36 +86,46 @@ def id_from_url(url):
     id_ind = url.find("v=") + 2
     return url[id_ind:]
 
-def thumbnail_path_from_url(url):
-    id = id_from_url(url)
-    return f"{CONFIG_DIR}{id}.jpg"
+def thumbnail_path(id):
+    return f"{CONFIG_DIR}thumbs/{id}.jpg"
 
-def download_thumbnail(url):
-    from urllib import request
+def rm_thumb(id):
+    path = thumbnail_path(id)
+    if os.path.exists(path):
+        os.remove(path)
+
+async def download_thumbnail(session, url):
     import os
     id = id_from_url(url)
-    request.urlretrieve(f"https://i1.ytimg.com/vi/{id}/hqdefault.jpg", thumbnail_path_from_url(url))
+    with open(thumbnail_path(id), "wb") as out:
+        async with async_timeout.timeout(5):
+            async with await session.get(f"https://i1.ytimg.com/vi/{id}/hq720.jpg") as resp:
+                out.write(await resp.read())
 
-def renew_queue(args):
+async def renew_queue(args):
     Q = read_queue()
     last_fetch = Q["fetch_time"] if "fetch_time" in Q else 0
     new_fetch = time.time() + time.timezone
     new_vids = []
     subs = get_subs()
-    for i, sub in enumerate(subs):
-        print(f"Fetching subscribers {i+1}/{len(subs)}", end="\r")
-        new_vids.extend(get_vids_from_sub(sub, last_fetch))
+    print("Fetching subscribers...")
+    async with aiohttp.ClientSession() as session:
+        tasks = [get_vids_from_sub(session, sub, last_fetch) for sub in subs]
+        new = await asyncio.gather(*tasks)
+    for n in new:
+        new_vids.extend(n)
     print()
     Q["fetch_time"] = new_fetch
     Q["videos"] = (Q["videos"] if "videos" in Q else []) + new_vids
     print(f"Added {len(new_vids)} videos to queue")
     # dump_queue(Q)
-    for i, video in enumerate(new_vids):
-        print(f"Downloading thumbnails {i+1}/{len(new_vids)}", end="\r")
-        link = video["link"]
-        video["duration"] = get_duration(link)
-        # dump_queue(Q)
-        # download_thumbnail(link)
+    print(f"Getting durations...")
+    async with aiohttp.ClientSession() as session:
+        for i, video in enumerate(new_vids):
+            print(f"Downloading thumbnails {i+1}/{len(new_vids)}")
+            link = video["link"]
+            video["duration"] = await get_duration(session, link)
+            await download_thumbnail(session, link)
     ranks = {sub["name"]: sub["rank"] for sub in subs}
     Q["videos"].sort(key=lambda v:(ranks.get(v["channel"], 100), v["unix_time"], v["channel"]))
     Q["videos"].reverse()
@@ -118,7 +135,10 @@ def renew_queue(args):
 def add_vid(args):
     link = args.link
     Q = read_queue()
-    Q["videos"].insert(0, get_info(link))
+    with aiohttp.ClientSession() as session:
+        info = get_info(session, link)
+    if info:
+        Q["videos"].insert(0, info)
     dump_queue(Q)
 
 def list_videos():
@@ -127,16 +147,9 @@ def list_videos():
         print("{:20}{:80}{}".format(vid["channel"], vid["title"], time.ctime(vid["unix_time"])))
 
 def get_entry_line(v, channel_width):
-    import time
-    duration = v["duration"]
     return "\b".join([
         f"{'W ' if 'watched' in v else '  '}{v['channel']:{channel_width}}{v['title']}",
         v["link"],
-        v["channel"],
-        v["title"],
-        time.ctime(v["unix_time"]),
-        f"{duration//60:02}:{duration%60:02}",
-        f"Watched: {v['watched']//60:02}:{v['watched']%60:02}" if "watched" in v else "",
     ])
 
 def fzf_get_lines():
@@ -151,8 +164,42 @@ def fzf_get_lines_cmd(args):
     print(fzf_get_lines())
 
 def play_queue(args):
-    import textwrap, itertools, glob
-    from subprocess import Popen, PIPE
+    from subprocess import Popen, PIPE, DEVNULL
+    import os, threading
+    import ueberzug.lib.v0 as ueberzug
+    link_fifo = f"{CONFIG_DIR}link_fifo.{os.getpid()}"
+    preview_fifo = f"{CONFIG_DIR}preview_fifo.{os.getpid()}"
+    os.mkfifo(link_fifo)
+    os.mkfifo(preview_fifo)
+
+    def preview_task(_link_fifo, _preview_fifo, videos):
+        import textwrap
+        space = " " * 37
+        with ueberzug.Canvas() as c:
+            uz = c.create_placement('youtube-preview', x=0, y=1, max_height=8)
+            while True:
+                with open(_link_fifo) as link_fifo:
+                    for link in link_fifo:
+                        id = id_from_url(link.strip())
+                        vid = [v for v in videos if id in v["link"]][0]
+                        duration = vid["duration"]
+                        preview_lines = [
+                            f"Channel: {vid['channel']}",
+                            f"Title: {vid['title']}",
+                            f"Publish Time: {time.ctime(vid['unix_time'])}",
+                            f"Length: {duration//60:02}:{duration%60:02}",
+                            f"Watched: {vid['watched']//60:02}:{vid['watched']%60:02}" if "watched" in vid else "",
+                        ]
+                        preview_lines = [w + "\n"
+                                         for l in preview_lines
+                                         for w in textwrap.wrap(l, width=87 - 4, initial_indent=space, subsequent_indent=space)]
+                        preview_lines = preview_lines[:7]
+                        preview_lines.extend((7 - len(preview_lines)) * ["\n"])
+                        uz.path = thumbnail_path(id)
+                        uz.visibility = ueberzug.Visibility.VISIBLE
+                        with open(_preview_fifo, "w") as preview_fifo:
+                            preview_fifo.write("".join(preview_lines))
+    threading.Thread(target=preview_task, args=(link_fifo, preview_fifo, read_queue()["videos"]), daemon=True).start()
     while True:
         fzf_input = fzf_get_lines()
         fzf_binds = [
@@ -161,23 +208,6 @@ def play_queue(args):
             ("ctrl-r", "reload(youtube.py fzf-lines)"),
             ("?", "execute(less {f})"),
         ]
-        # ueberzug_arg = "\\t".join(f"{t[0]}\\t{t[1]}" for t in [
-        #     ("x", "0"),
-        #     ("y", "4"),
-        #     ("identifier", "youtube-preview"),
-        #     ("max_width", "$FZF_PREVIEW_COLUMNS"),
-        #     ("max_height", "$FZF_PREVIEW_LINES"),
-        #     ("action", "add"),
-        #     ("path", "/home/steven/.config/youtube/8zoPyMAsVek.jpg"),
-        # ])
-        fzf_preview_cmds = "; ".join([
-            "echo Channel: {3}",
-            "echo Title: {4}",
-            "echo Publish Time: {5}",
-            "echo Length: {6}",
-            "echo {7}",
-            # f"{{echo \"{ueberzug_arg}\"; sleep 2;}} | ueberzug layer -p simple",
-        ])
         fzf_opts = [
             "-e",   # --exact
             # "-s",
@@ -189,8 +219,8 @@ def play_queue(args):
             "--with-nth=1",
             "--expect=del,enter",
             "--info=inline",
-            f"--preview='{fzf_preview_cmds}'",
-            "--preview-window=down:5:wrap",
+            f"--preview='echo {{2}} >> {link_fifo} && head -n7 {preview_fifo}'",
+            "--preview-window=up:7:wrap",
         ]
         fzf_opts.append("--bind='" + ",".join(f"{b[0]}:{b[1]}" for b in fzf_binds) + "'")
         fzf_cmd = f"fzf {' '.join(fzf_opts)}"
@@ -206,29 +236,43 @@ def play_queue(args):
         if key == "del":
             Q = read_queue()
             Q["videos"] = list(filter(lambda v:v["link"] not in results, Q["videos"]))
+            for link in results:
+                id = id_from_url(link)
+                rm_thumb(id)
             dump_queue(Q)
         else:
             # os.system("tput rmcup")
             print(f"Playing: {results[0]}")
-            Popen("mpv --quiet " + " ".join(results), shell=True, stdout=None).wait()
+            proc = Popen(["mpv", "--script-opts=ytdl_hook-ytdl_path=yt-dlp",  "--ytdl-raw-options=external-downloader=aria2c,throttled-rate=300k,mark-watched="] + results, stdout=None, stdin=DEVNULL)
+            proc.wait()
+            time.sleep(0.5)
     # os.system("tput rmcup")
+    os.remove(link_fifo)
+    os.remove(preview_fifo)
 
 def watched_video(args):
-    from glob import glob
+    # from glob import glob
     Q = read_queue()
     if args.finished:
         Q["videos"] = list(filter(lambda v:v["link"] != args.link, Q["videos"]))
         id = id_from_url(args.link)
-
-        for file in glob(f"{CONFIG_DIR}{id}.*"):
-            os.remove(file)
-        dump_queue(Q)
+        rm_thumb(id)
+        # for file in glob(f"{CONFIG_DIR}{id}.*"):
+        #     os.remove(file)
     else:
         for i, video in enumerate(Q["videos"]):
             if video["link"] == args.link:
                 Q["videos"][i]["watched"] = int(float(args.time))
                 break
-        dump_queue(Q)
+        else:
+            async def f():
+                async with aiohttp.ClientSession() as session:
+                    video = await get_info(session, args.link)
+                    video["watched"] = int(float(args.time))
+                    Q["videos"].insert(0, video)
+            asyncio.run(f())
+    dump_queue(Q)
+    # pprint.pp(read_queue())
 
 if __name__ == "__main__":
     import sys
@@ -241,7 +285,7 @@ if __name__ == "__main__":
     add_cmd.add_argument("link")
     add_cmd.set_defaults(func=add_vid)
     fetch_cmd = sub_parsers.add_parser("fetch")
-    fetch_cmd.set_defaults(func=renew_queue)
+    fetch_cmd.set_defaults(func=lambda args: asyncio.run(renew_queue(args)))
     mpv_watch_cmd = sub_parsers.add_parser("mpv_watched")
     mpv_watch_cmd.set_defaults(func=watched_video, finished=True)
     mpv_watch_cmd.add_argument("link")
