@@ -112,11 +112,21 @@ async def renew_queue(args):
     async with aiohttp.ClientSession() as session:
         tasks = [get_vids_from_sub(session, sub, last_fetch) for sub in subs]
         new = await asyncio.gather(*tasks)
+    old_vids = Q["videos"] if "videos" in Q else []
     for n in new:
-        new_vids.extend(n)
+        for v in n:
+            for i, old in enumerate(new_vids):
+                if old["link"] == v["link"]:
+                    print(old["link"], old["title"])
+                    old_vids[i]["title"] = v["title"]
+                    old_vids[i]["unix_time"] = v["unix_time"]
+                    old_vids[i]["duration"] = v["duration"]
+                    break
+            else:
+                new_vids.append(v)
     print()
     Q["fetch_time"] = new_fetch
-    Q["videos"] = (Q["videos"] if "videos" in Q else []) + new_vids
+    Q["videos"] = old_vids + new_vids
     print(f"Added {len(new_vids)} videos to queue")
     # dump_queue(Q)
     print(f"Getting durations...")
