@@ -168,9 +168,16 @@ def get_entry_line(v, channel_width):
 def fzf_get_lines():
     Q = read_queue()
     videos = Q["videos"]
-    channel_width = max(map(lambda v:len(v["channel"]), videos)) + 2
+    filtered = []
+    chans = defaultdict(int)
+    for v in videos:
+        chan = v["channel"]
+        chans[chan] += 1
+        if chans[chan] <= 3:
+            filtered.append(v)
+    channel_width = max(map(lambda v:len(v["channel"]), filtered)) + 2
     fzf_lines = [f"W {'Channel':{channel_width}}Title"]
-    fzf_lines.extend(get_entry_line(v, channel_width) for v in videos)
+    fzf_lines.extend(get_entry_line(v, channel_width) for v in filtered)
     return "\n".join(fzf_lines)
 
 def fzf_get_lines_cmd(args):
