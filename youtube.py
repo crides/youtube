@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 
+from collections import defaultdict
 import json, os, time, asyncio, aiohttp, async_timeout, pprint
 
 CONFIG_DIR = f"{os.environ['HOME']}/.config/youtube/"
@@ -30,15 +31,15 @@ async def get_vids_from_sub(session, sub, from_time):
     new_vids = []
     for entry in feed.entries:
         try:
-            unix_time = time.mktime(entry["published_parsed"])
+            pub_time = time.mktime(entry["published_parsed"])
         except:
-            unix_time = time.time()
-        if unix_time > from_time:
+            pub_time = time.time()
+        if pub_time > from_time:
             new_vids.append({
                 "channel": sub["name"],
                 "title": html.unescape(entry["title"]),
                 "link": entry["link"],
-                "unix_time": unix_time,
+                "time": pub_time,
             })
     return new_vids
 
@@ -66,7 +67,7 @@ def parse_time(s):
 async def get_info(session, url):
     # Naive processing without BS
     import re, html
-    body = (await fetch(session, url)).read().decode("utf8")
+    body = (await fetch(session, url))
     lines = body.split("\n")
     for line in lines:
         prop_ind = line.find('itemprop="duration"')
@@ -78,13 +79,19 @@ async def get_info(session, url):
                 "channel": channel,
                 "title": html.unescape(props["name"]),
                 "link": url,
-                "unix_time": time.time(),
+                "time": time.time(),
                 "duration": duration,
             }
 
 def id_from_url(url):
-    id_ind = url.find("v=") + 2
-    return url[id_ind:]
+    from urllib.parse import urlparse, parse_qs
+    url = urlparse(url)
+    if url.hostname == None:
+        return
+    if url.hostname == "youtu.be":
+        return url.path
+    if url.hostname.endswith("youtube.com"):
+        return parse_qs(url.query)["v"][0]
 
 def thumbnail_path(id):
     return f"{CONFIG_DIR}thumbs/{id}.jpg"
@@ -100,7 +107,11 @@ async def download_thumbnail(session, url):
     with open(thumbnail_path(id), "wb") as out:
         async with async_timeout.timeout(5):
             async with await session.get(f"https://i1.ytimg.com/vi/{id}/hq720.jpg") as resp:
-                out.write(await resp.read())
+                if resp.status == 404:
+                    async with await session.get(f"https://i.ytimg.com/vi/{id}/hqdefault.jpg") as resp:
+                        out.write(await resp.read())
+                else:
+                    out.write(await resp.read())
 
 async def renew_queue(args):
     Q = read_queue()
@@ -113,20 +124,9 @@ async def renew_queue(args):
         tasks = [get_vids_from_sub(session, sub, last_fetch) for sub in subs]
         new = await asyncio.gather(*tasks)
     old_vids = Q["videos"] if "videos" in Q else []
-    for n in new:
-        for v in n:
-            for i, old in enumerate(new_vids):
-                if old["link"] == v["link"]:
-                    print(old["link"], old["title"])
-                    old_vids[i]["title"] = v["title"]
-                    old_vids[i]["unix_time"] = v["unix_time"]
-                    old_vids[i]["duration"] = v["duration"]
-                    break
-            else:
-                new_vids.append(v)
+    new_vids = [v for n in new for v in n]
+    filtered_old_vids = [o for o in old_vids if all(n["link"] != o["link"] for n in new_vids)]
     print()
-    Q["fetch_time"] = new_fetch
-    Q["videos"] = old_vids + new_vids
     print(f"Added {len(new_vids)} videos to queue")
     # dump_queue(Q)
     print(f"Getting durations...")
@@ -137,16 +137,19 @@ async def renew_queue(args):
             video["duration"] = await get_duration(session, link)
             await download_thumbnail(session, link)
     ranks = {sub["name"]: sub["rank"] for sub in subs}
-    Q["videos"].sort(key=lambda v:(ranks.get(v["channel"], 100), v["unix_time"], v["channel"]))
+    Q["fetch_time"] = new_fetch
+    Q["videos"] = filtered_old_vids + new_vids
+    Q["videos"].sort(key=lambda v:(ranks.get(v["channel"], 100), v["time"], v["channel"]))
     Q["videos"].reverse()
     dump_queue(Q)
     print()
 
-def add_vid(args):
+async def add_vid(args):
     link = args.link
     Q = read_queue()
-    with aiohttp.ClientSession() as session:
-        info = get_info(session, link)
+    async with aiohttp.ClientSession() as session:
+        info = await get_info(session, link)
+        await download_thumbnail(session, link)
     if info:
         Q["videos"].insert(0, info)
     dump_queue(Q)
@@ -154,7 +157,7 @@ def add_vid(args):
 def list_videos():
     print("{:20}{:80}{}".format("Channel", "Title", "Time"))
     for vid in json.load(open(QUEUE_FILE))["videos"]:
-        print("{:20}{:80}{}".format(vid["channel"], vid["title"], time.ctime(vid["unix_time"])))
+        print("{:20}{:80}{}".format(vid["channel"], vid["title"], time.ctime(vid["time"])))
 
 def get_entry_line(v, channel_width):
     return "\b".join([
@@ -191,24 +194,29 @@ def play_queue(args):
                 with open(_link_fifo) as link_fifo:
                     for link in link_fifo:
                         id = id_from_url(link.strip())
-                        vid = [v for v in videos if id in v["link"]][0]
-                        duration = vid["duration"]
-                        preview_lines = [
-                            f"Channel: {vid['channel']}",
-                            f"Title: {vid['title']}",
-                            f"Publish Time: {time.ctime(vid['unix_time'])}",
-                            f"Length: {duration//60:02}:{duration%60:02}",
-                            f"Watched: {vid['watched']//60:02}:{vid['watched']%60:02}" if "watched" in vid else "",
-                        ]
-                        preview_lines = [w + "\n"
-                                         for l in preview_lines
-                                         for w in textwrap.wrap(l, width=87 - 4, initial_indent=space, subsequent_indent=space)]
-                        preview_lines = preview_lines[:7]
-                        preview_lines.extend((7 - len(preview_lines)) * ["\n"])
-                        uz.path = thumbnail_path(id)
-                        uz.visibility = ueberzug.Visibility.VISIBLE
-                        with open(_preview_fifo, "w") as preview_fifo:
-                            preview_fifo.write("".join(preview_lines))
+                        vids = [v for v in videos if id in v["link"]]
+                        if len(vids) == 1:
+                            vid = vids[0]
+                            duration = vid["duration"]
+                            preview_lines = [
+                                f"Channel: {vid['channel']}",
+                                f"Title: {vid['title']}",
+                                f"Publish Time: {time.ctime(vid['time'])}",
+                                f"Length: {duration//60:02}:{duration%60:02}",
+                                f"Watched: {vid['watched']//60:02}:{vid['watched']%60:02}" if "watched" in vid else "",
+                            ]
+                            preview_lines = [w + "\n"
+                                             for l in preview_lines
+                                             for w in textwrap.wrap(l, width=87 - 4, initial_indent=space, subsequent_indent=space)]
+                            preview_lines = preview_lines[:7]
+                            preview_lines.extend((7 - len(preview_lines)) * ["\n"])
+                            uz.path = thumbnail_path(id)
+                            uz.visibility = ueberzug.Visibility.VISIBLE
+                            with open(_preview_fifo, "w") as preview_fifo:
+                                preview_fifo.write("".join(preview_lines))
+                        else:
+                            with open(_preview_fifo, "w") as preview_fifo:
+                                preview_fifo.write("")
     threading.Thread(target=preview_task, args=(link_fifo, preview_fifo, read_queue()["videos"]), daemon=True).start()
     while True:
         fzf_input = fzf_get_lines()
@@ -263,9 +271,11 @@ def play_queue(args):
 def watched_video(args):
     # from glob import glob
     Q = read_queue()
+    id = id_from_url(args.link)
+    if id == None:
+        return
     if args.finished:
         Q["videos"] = list(filter(lambda v:v["link"] != args.link, Q["videos"]))
-        id = id_from_url(args.link)
         rm_thumb(id)
         # for file in glob(f"{CONFIG_DIR}{id}.*"):
         #     os.remove(file)
@@ -293,7 +303,7 @@ if __name__ == "__main__":
     play_cmd.set_defaults(func=play_queue)
     add_cmd = sub_parsers.add_parser("add")
     add_cmd.add_argument("link")
-    add_cmd.set_defaults(func=add_vid)
+    add_cmd.set_defaults(func=lambda args: asyncio.run(add_vid(args)))
     fetch_cmd = sub_parsers.add_parser("fetch")
     fetch_cmd.set_defaults(func=lambda args: asyncio.run(renew_queue(args)))
     mpv_watch_cmd = sub_parsers.add_parser("mpv_watched")
