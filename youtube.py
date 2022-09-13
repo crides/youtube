@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 
 from collections import defaultdict
-import json, os, time, asyncio, aiohttp, async_timeout, pprint
+import json, os, time, asyncio, aiohttp, async_timeout
 
 CONFIG_DIR = f"{os.environ['HOME']}/.config/youtube/"
 QUEUE_FILE = f"{CONFIG_DIR}youtube.json"
@@ -41,6 +41,7 @@ async def get_vids_from_sub(session, sub, from_time):
         if pub_time > from_time:
             new_vids.append({
                 "channel": sub["name"],
+                "channel_id": sub["id"],
                 "title": html.unescape(entry["title"]),
                 "link": entry["link"],
                 "time": pub_time,
@@ -68,24 +69,20 @@ def parse_time(s):
     time = int(time[0]) * 60 + int(time[1])
     return time
 
-async def get_info(session, url):
+def get_info(url):
     # Naive processing without BS
-    import re, html
-    body = (await fetch(session, url))
-    lines = body.split("\n")
-    for line in lines:
-        prop_ind = line.find('itemprop="duration"')
-        if prop_ind != -1:
-            props = {m[0]: m[1] for m in re.findall(r"<meta itemprop=\"(.+?)\" content=\"(.+?)\">", line)}
-            channel = re.search(r"<link itemprop=\"name\" content=\"(.+?)\">", line).group(1)
-            duration = parse_time(props["duration"]) if "duration" in props else 0xAA
-            return {
-                "channel": channel,
-                "title": html.unescape(props["name"]),
-                "link": url,
-                "time": time.time(),
-                "duration": duration,
-            }
+    from yt_dlp import YoutubeDL
+    opts = {"quiet": True, "no_warnings": True}
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        return {
+            "channel": info["channel"],
+            "title": info["title"],
+            "channel_id": info["channel_id"],
+            "link": url,
+            "time": time.time(),
+            "duration": info["duration"],
+        }
 
 def id_from_url(url):
     from urllib.parse import urlparse, parse_qs
@@ -106,7 +103,6 @@ def rm_thumb(id):
         os.remove(path)
 
 async def download_thumbnail(session, url):
-    import os
     id = id_from_url(url)
     with open(thumbnail_path(id), "wb") as out:
         async with async_timeout.timeout(5):
@@ -152,7 +148,7 @@ async def add_vid(args):
     link = args.link
     Q = read_queue()
     async with aiohttp.ClientSession() as session:
-        info = await get_info(session, link)
+        info = get_info(link)
         await download_thumbnail(session, link)
     if info:
         Q["videos"].insert(0, info)
@@ -205,7 +201,7 @@ async def play_queue():
                 with open(_link_fifo) as link_fifo:
                     for link in link_fifo:
                         id = id_from_url(link.strip())
-                        vids = [v for v in videos if id in v["link"]]
+                        vids = [v for v in read_queue()["videos"] if id in v["link"]]
                         if len(vids) == 1:
                             vid = vids[0]
                             duration = vid["duration"]
@@ -228,7 +224,7 @@ async def play_queue():
                         else:
                             with open(_preview_fifo, "w") as preview_fifo:
                                 preview_fifo.write("")
-    threading.Thread(target=preview_task, args=(link_fifo, preview_fifo, read_queue()["videos"]), daemon=True).start()
+    threading.Thread(target=preview_task, args=(link_fifo, preview_fifo), daemon=True).start()
     while True:
         fzf_input = fzf_get_lines()
         fzf_binds = [
@@ -246,12 +242,12 @@ async def play_queue():
             "--header-lines=1",
             "-d \b",  # --delimiter
             "--with-nth=1",
-            "--expect=del,enter",
+            "--expect=del,enter,esc,ctrl-a,ctrl-x",
             "--info=inline",
             f"--preview='echo {{2}} >> {link_fifo} && head -n7 {preview_fifo}'",
             "--preview-window=up:7:wrap",
         ]
-        fzf_opts.append("--bind='" + ",".join(f"{b[0]}:{b[1]}" for b in fzf_binds) + "'")
+        fzf_opts.append("--bind='" + ",".join(f"{k}:{a}" for k, a in fzf_binds) + "'")
         fzf_cmd = f"fzf {' '.join(fzf_opts)}"
         fzf = Popen(fzf_cmd, stdin=PIPE, stdout=PIPE, shell=True)
         fzf.stdin.write(bytes(fzf_input, "utf8"))
@@ -269,7 +265,29 @@ async def play_queue():
                 id = id_from_url(link)
                 rm_thumb(id)
             dump_queue(Q)
-        else:
+        elif key == "ctrl-c":
+            break
+        elif key == "esc":
+            await renew_queue()
+        elif key == "ctrl-a":
+            subs = get_subs()
+            for link in results:
+                channel_id = list(filter(lambda v:v["link"] == link, read_queue()["videos"]))[0]["channel_id"]
+                for sub in subs:
+                    if sub["id"] == channel_id:
+                        sub["rank"] += 1
+                        break
+            set_subs(subs)
+        elif key == "ctrl-x":
+            subs = get_subs()
+            for link in results:
+                channel_id = list(filter(lambda v:v["link"] == link, read_queue()["videos"]))[0]["channel_id"]
+                for sub in subs:
+                    if sub["id"] == channel_id:
+                        sub["rank"] -= 1
+                        break
+            set_subs(subs)
+        else:   # enter
             # os.system("tput rmcup")
             print(f"Playing: {results[0]}")
             proc = Popen(["mpv", "--script-opts=ytdl_hook-ytdl_path=yt-dlp",  "--ytdl-raw-options=external-downloader=aria2c,throttled-rate=300k,mark-watched="] + results, stdout=None, stdin=DEVNULL)
@@ -297,12 +315,9 @@ def watched_video(args):
                     Q["videos"][i]["watched"] = int(float(args.time))
                     break
             else:
-                async def f():
-                    async with aiohttp.ClientSession() as session:
-                        video = await get_info(session, args.link)
-                        video["watched"] = int(float(args.time))
-                        Q["videos"].insert(0, video)
-                asyncio.run(f())
+                video = get_info(args.link)
+                video["watched"] = int(float(args.time))
+                Q["videos"].insert(0, video)
     dump_queue(Q)
     # pprint.pp(read_queue())
 
