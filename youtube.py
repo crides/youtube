@@ -117,7 +117,7 @@ async def download_thumbnail(session, url):
                 else:
                     out.write(await resp.read())
 
-async def renew_queue(args):
+async def renew_queue():
     Q = read_queue()
     last_fetch = Q["fetch_time"] if "fetch_time" in Q else 0
     new_fetch = time.time() + time.timezone
@@ -187,7 +187,7 @@ def fzf_get_lines():
 def fzf_get_lines_cmd(args):
     print(fzf_get_lines())
 
-def play_queue(args):
+async def play_queue():
     from subprocess import Popen, PIPE, DEVNULL
     import os, threading
     import ueberzug.lib.v0 as ueberzug
@@ -196,7 +196,7 @@ def play_queue(args):
     os.mkfifo(link_fifo)
     os.mkfifo(preview_fifo)
 
-    def preview_task(_link_fifo, _preview_fifo, videos):
+    def preview_task(_link_fifo, _preview_fifo):
         import textwrap
         space = " " * 37
         with ueberzug.Canvas() as c:
@@ -314,18 +314,20 @@ async def sub_with_vid(args):
         info = ydl.extract_info(args.link, download=False)
         subs.append({"id": info["channel_id"], "name": info["channel"], "rank": args.rank})
         set_subs(subs)
+
+async def main():
+    await renew_queue()
+    await play_queue()
+
 if __name__ == "__main__":
     import sys
     from argparse import ArgumentParser
     parser = ArgumentParser()
+    parser.set_defaults(func=lambda _: asyncio.run(main()))
     sub_parsers = parser.add_subparsers()
-    play_cmd = sub_parsers.add_parser("play")
-    play_cmd.set_defaults(func=play_queue)
     add_cmd = sub_parsers.add_parser("add")
     add_cmd.add_argument("link")
     add_cmd.set_defaults(func=lambda args: asyncio.run(add_vid(args)))
-    fetch_cmd = sub_parsers.add_parser("fetch")
-    fetch_cmd.set_defaults(func=lambda args: asyncio.run(renew_queue(args)))
     mpv_watch_cmd = sub_parsers.add_parser("mpv_watched")
     mpv_watch_cmd.set_defaults(func=watched_video, finished=True)
     mpv_watch_cmd.add_argument("link")
