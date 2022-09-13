@@ -291,17 +291,18 @@ def watched_video(args):
         # for file in glob(f"{CONFIG_DIR}{id}.*"):
         #     os.remove(file)
     else:
-        for i, video in enumerate(Q["videos"]):
-            if video["link"] == args.link:
-                Q["videos"][i]["watched"] = int(float(args.time))
-                break
-        else:
-            async def f():
-                async with aiohttp.ClientSession() as session:
-                    video = await get_info(session, args.link)
-                    video["watched"] = int(float(args.time))
-                    Q["videos"].insert(0, video)
-            asyncio.run(f())
+        if args.time != "":
+            for i, video in enumerate(Q["videos"]):
+                if video["link"] == args.link:
+                    Q["videos"][i]["watched"] = int(float(args.time))
+                    break
+            else:
+                async def f():
+                    async with aiohttp.ClientSession() as session:
+                        video = await get_info(session, args.link)
+                        video["watched"] = int(float(args.time))
+                        Q["videos"].insert(0, video)
+                asyncio.run(f())
     dump_queue(Q)
     # pprint.pp(read_queue())
 
