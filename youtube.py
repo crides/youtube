@@ -5,6 +5,7 @@ import json, os, time, asyncio, aiohttp, async_timeout, pprint
 
 CONFIG_DIR = f"{os.environ['HOME']}/.config/youtube/"
 QUEUE_FILE = f"{CONFIG_DIR}youtube.json"
+SUBS_FILE = f"{CONFIG_DIR}subs.json"
 
 def dump_queue(Q):
     with open(QUEUE_FILE, "w") as out:
@@ -16,8 +17,11 @@ def read_queue():
     return json.load(open(QUEUE_FILE))
 
 def get_subs():
-    import json
-    return json.load(open(f"{CONFIG_DIR}subs.json"))
+    return json.load(open(SUBS_FILE))
+
+def set_subs(subs):
+    with open(SUBS_FILE, "w") as out:
+        json.dump(subs, out)
 
 async def fetch(session, url):
     async with async_timeout.timeout(5):
@@ -301,6 +305,14 @@ def watched_video(args):
     dump_queue(Q)
     # pprint.pp(read_queue())
 
+async def sub_with_vid(args):
+    from yt_dlp import YoutubeDL
+    subs = get_subs()
+    opts = {"quiet": True, "no_warnings": True}
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(args.link, download=False)
+        subs.append({"id": info["channel_id"], "name": info["channel"], "rank": args.rank})
+        set_subs(subs)
 if __name__ == "__main__":
     import sys
     from argparse import ArgumentParser
@@ -322,6 +334,10 @@ if __name__ == "__main__":
     mpv_Watch_cmd.add_argument("time")
     fzf_cmd = sub_parsers.add_parser("fzf-lines")
     fzf_cmd.set_defaults(func=fzf_get_lines_cmd)
+    sub_cmd = sub_parsers.add_parser("sub")
+    sub_cmd.add_argument("link")
+    sub_cmd.add_argument("-r", "--rank", type=int, default=5, required=False)
+    sub_cmd.set_defaults(func=lambda args: asyncio.run(sub_with_vid(args)))
 
     match = parser.parse_args()
     match.func(match)
