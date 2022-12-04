@@ -1,11 +1,20 @@
 #!/usr/bin/python3
 
 from collections import defaultdict
-import json, os, time, asyncio, aiohttp, async_timeout
+from typing import List
+from serde import Model, fields
+import json, yaml, os, time, asyncio, aiohttp, async_timeout, copy
 
 CONFIG_DIR = f"{os.environ['HOME']}/.config/youtube/"
 QUEUE_FILE = f"{CONFIG_DIR}youtube.json"
-SUBS_FILE = f"{CONFIG_DIR}subs.json"
+SUBS_FILE = f"{CONFIG_DIR}subs.yml"
+
+class Sub(Model):
+    name: fields.Str()
+    id: fields.Str()
+    rank: fields.Int()
+    filter: fields.Optional(fields.Str)
+    res: fields.Optional(fields.Int)
 
 def dump_queue(Q):
     with open(QUEUE_FILE, "w") as out:
@@ -16,21 +25,21 @@ def dump_queue(Q):
 def read_queue():
     return json.load(open(QUEUE_FILE))
 
-def get_subs():
-    return json.load(open(SUBS_FILE))
+def get_subs() -> List[Sub]:
+    return [Sub.from_dict(s) for s in yaml.safe_load(open(SUBS_FILE))]
 
-def set_subs(subs):
+def set_subs(subs: List[Sub]):
     with open(SUBS_FILE, "w") as out:
-        json.dump(subs, out)
+        yaml.dump([s.to_dict() for s in subs], out)
 
 async def fetch(session, url):
     async with async_timeout.timeout(5):
         async with await session.get(url) as resp:
             return await resp.text()
 
-async def get_vids_from_sub(session, sub, from_time):
+async def get_vids_from_sub(session, sub: Sub, from_time):
     import feedparser, time, html
-    url = "https://www.youtube.com/feeds/videos.xml?channel_id=" + sub["id"]
+    url = "https://www.youtube.com/feeds/videos.xml?channel_id=" + sub.id
     feed = feedparser.parse(await fetch(session, url))
     new_vids = []
     for entry in feed.entries:
@@ -40,8 +49,8 @@ async def get_vids_from_sub(session, sub, from_time):
             pub_time = time.time()
         if pub_time > from_time:
             new_vids.append({
-                "channel": sub["name"],
-                "channel_id": sub["id"],
+                "channel": sub.name,
+                "channel_id": sub.id,
                 "title": html.unescape(entry["title"]),
                 "link": entry["link"],
                 "time": pub_time,
@@ -128,19 +137,20 @@ async def renew_queue():
     filtered_old_vids = [o for o in old_vids if all(n["link"] != o["link"] for n in new_vids)]
     print()
     print(f"Added {len(new_vids)} videos to queue")
-    # dump_queue(Q)
     print(f"Getting durations...")
     async with aiohttp.ClientSession() as session:
-        for i, video in enumerate(new_vids):
-            print(f"Downloading thumbnails {i+1}/{len(new_vids)}")
-            link = video["link"]
-            video["duration"] = await get_duration(session, link)
-            await download_thumbnail(session, link)
-    ranks = {sub["name"]: sub["rank"] for sub in subs}
+        await asyncio.gather(*[download_thumbnail(session, v["link"]) for v in new_vids])
+        durations = await asyncio.gather(*[get_duration(session, v["link"]) for v in new_vids])
+        for i in range(len(new_vids)):
+            new_vids[i]["duration"] = durations[i]
+    ranks = {sub.name: sub.rank for sub in subs}
     Q["fetch_time"] = new_fetch
-    Q["videos"] = filtered_old_vids + new_vids
-    Q["videos"].sort(key=lambda v:(ranks.get(v["channel"], 100), v["time"], v["channel"]))
-    Q["videos"].reverse()
+    filters = {sub.name: sub.filter for sub in subs if sub.filter}
+    def eval_filter(f: str, v: dict) -> bool:
+        v["now"] = time.time()
+        return eval(f, copy.deepcopy(v))
+    videos = [v for v in filtered_old_vids + new_vids if v["channel"] not in filters or eval_filter(filters[v["channel"]], v)]
+    Q["videos"] = list(reversed(sorted(videos, key=lambda v:(ranks.get(v["channel"], 100), v["time"], v["channel"]))))
     dump_queue(Q)
     print()
 
@@ -192,6 +202,13 @@ async def play_queue():
     os.mkfifo(link_fifo)
     os.mkfifo(preview_fifo)
 
+    def render_dur(dur):
+        def render_lower(dur):
+            return f"{dur//60:02}:{dur%60:02}"
+        if dur < 3600:
+            return render_lower(dur)
+        return str(int(dur // 3600)) + ":" + render_lower(dur % 3600)
+
     def preview_task(_link_fifo, _preview_fifo):
         import textwrap
         space = " " * 37
@@ -209,8 +226,8 @@ async def play_queue():
                                 f"Channel: {vid['channel']}",
                                 f"Title: {vid['title']}",
                                 f"Publish Time: {time.ctime(vid['time'])}",
-                                f"Length: {duration//60:02}:{duration%60:02}",
-                                f"Watched: {vid['watched']//60:02}:{vid['watched']%60:02}" if "watched" in vid else "",
+                                f"Length: {render_dur(duration)}",
+                                f"Watched: {render_dur(vid['watched'])}" if "watched" in vid else "",
                             ]
                             preview_lines = [w + "\n"
                                              for l in preview_lines
@@ -274,8 +291,8 @@ async def play_queue():
             for link in results:
                 channel_id = list(filter(lambda v:v["link"] == link, read_queue()["videos"]))[0]["channel_id"]
                 for sub in subs:
-                    if sub["id"] == channel_id:
-                        sub["rank"] += 1
+                    if sub.id == channel_id:
+                        sub.rank += 1
                         break
             set_subs(subs)
         elif key == "ctrl-x":
@@ -283,14 +300,15 @@ async def play_queue():
             for link in results:
                 channel_id = list(filter(lambda v:v["link"] == link, read_queue()["videos"]))[0]["channel_id"]
                 for sub in subs:
-                    if sub["id"] == channel_id:
-                        sub["rank"] -= 1
+                    if sub.id == channel_id:
+                        sub.rank -= 1
                         break
             set_subs(subs)
         else:   # enter
             # os.system("tput rmcup")
             print(f"Playing: {results[0]}")
-            proc = Popen(["mpv", "--script-opts=ytdl_hook-ytdl_path=yt-dlp",  "--ytdl-raw-options=external-downloader=aria2c,throttled-rate=300k,mark-watched="] + results, stdout=None, stdin=DEVNULL)
+            cookies = os.path.expanduser("~/.config/youtube/cookie.txt")
+            proc = Popen(["mpv", "--script-opts=ytdl_hook-ytdl_path=yt-dlp",  f"--ytdl-raw-options=external-downloader=aria2c,throttled-rate=300k,cookies={cookies},mark-watched="] + results, stdout=None, stdin=DEVNULL)
             proc.wait()
             time.sleep(0.5)
     # os.system("tput rmcup")
@@ -327,7 +345,8 @@ async def sub_with_vid(args):
     opts = {"quiet": True, "no_warnings": True}
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(args.link, download=False)
-        subs.append({"id": info["channel_id"], "name": info["channel"], "rank": args.rank})
+        assert info != None, f"Can't find video {args.link}"
+        subs.append(Sub(id=info["channel_id"], name=info["channel"], rank=args.rank))
         set_subs(subs)
 
 async def main():
