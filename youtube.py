@@ -306,9 +306,18 @@ async def play_queue():
             set_subs(subs)
         else:   # enter
             # os.system("tput rmcup")
+            Q = read_queue()
             print(f"Playing: {results[0]}")
             cookies = os.path.expanduser("~/.config/youtube/cookie.txt")
-            proc = Popen(["mpv", "--script-opts=ytdl_hook-ytdl_path=yt-dlp",  f"--ytdl-raw-options=external-downloader=aria2c,throttled-rate=300k,cookies={cookies},mark-watched="] + results, stdout=None, stdin=DEVNULL)
+            vid = [v for v in Q["videos"] if v["link"] == results[0]][0]
+            sub = [s for s in get_subs() if s.id == vid["channel_id"]][0]
+            res = sub.res if sub.res != None else 1080
+            proc = Popen(
+                [ "mpv"
+                , "--script-opts=ytdl_hook-ytdl_path=yt-dlp"
+                , f'--ytdl-format=bestvideo[height<={res}]+bestaudio/best[height<={res}]'
+                , f"--ytdl-raw-options=external-downloader=aria2c,throttled-rate=300k,cookies={cookies},mark-watched="
+                ] + results, stdout=None, stdin=DEVNULL)
             proc.wait()
             time.sleep(0.5)
     # os.system("tput rmcup")
