@@ -1,7 +1,6 @@
 #!/usr/bin/python3
 
 from collections import defaultdict
-from typing import List
 from serde import Model, fields
 import json, yaml, os, time, asyncio, aiohttp, async_timeout, copy
 
@@ -25,15 +24,15 @@ def dump_queue(Q):
 def read_queue():
     return json.load(open(QUEUE_FILE))
 
-def get_subs() -> List[Sub]:
+def get_subs() -> list[Sub]:
     return [Sub.from_dict(s) for s in yaml.safe_load(open(SUBS_FILE))]
 
-def set_subs(subs: List[Sub]):
+def set_subs(subs: list[Sub]):
     with open(SUBS_FILE, "w") as out:
         yaml.dump([s.to_dict() for s in subs], out)
 
 async def fetch(session, url):
-    async with async_timeout.timeout(5):
+    async with async_timeout.timeout(15):
         async with await session.get(url) as resp:
             return await resp.text()
 
@@ -93,15 +92,16 @@ def get_info(url):
             "duration": info["duration"],
         }
 
-def id_from_url(url):
+def id_from_url(url: str) -> str | None:
     from urllib.parse import urlparse, parse_qs
-    url = urlparse(url)
-    if url.hostname == None:
+    parsed = urlparse(url)
+    if parsed.hostname == None:
         return
-    if url.hostname == "youtu.be":
-        return url.path
-    if url.hostname.endswith("youtube.com"):
-        return parse_qs(url.query)["v"][0]
+    if parsed.hostname == "youtu.be":
+        return parsed.path
+    if parsed.hostname.endswith("youtube.com"):
+        return parse_qs(parsed.query)["v"][0]
+    raise ValueError(f"can't parse url: {url}")
 
 def thumbnail_path(id):
     return f"{CONFIG_DIR}thumbs/{id}.jpg"
@@ -111,8 +111,7 @@ def rm_thumb(id):
     if os.path.exists(path):
         os.remove(path)
 
-async def download_thumbnail(session, url):
-    id = id_from_url(url)
+async def download_thumbnail(session, id: str):
     with open(thumbnail_path(id), "wb") as out:
         async with async_timeout.timeout(5):
             async with await session.get(f"https://i1.ytimg.com/vi/{id}/hq720.jpg") as resp:
@@ -121,6 +120,19 @@ async def download_thumbnail(session, url):
                         out.write(await resp.read())
                 else:
                     out.write(await resp.read())
+
+async def sync_thumbnails(session, ids: list[str]):
+    cur_ids = set(p.replace(".jpg", "") for p in os.listdir(f"{CONFIG_DIR}thumbs/"))
+    need_ids = set(ids)
+    new_ids = need_ids - cur_ids
+    old_ids = cur_ids - need_ids
+    await asyncio.gather(*[download_thumbnail(session, id) for id in new_ids])
+    for old in old_ids:
+        os.remove(thumbnail_path(old))
+
+def sort_vids(vids, subs):
+    ranks = {sub.name: sub.rank for sub in subs}
+    return list(reversed(sorted(vids, key=lambda v:(ranks.get(v["channel"], 100), v["time"], v["channel"]))))
 
 async def renew_queue():
     Q = read_queue()
@@ -136,21 +148,25 @@ async def renew_queue():
     new_vids = [v for n in new for v in n]
     filtered_old_vids = [o for o in old_vids if all(n["link"] != o["link"] for n in new_vids)]
     print()
-    print(f"Added {len(new_vids)} videos to queue")
     print(f"Getting durations...")
     async with aiohttp.ClientSession() as session:
-        await asyncio.gather(*[download_thumbnail(session, v["link"]) for v in new_vids])
         durations = await asyncio.gather(*[get_duration(session, v["link"]) for v in new_vids])
         for i in range(len(new_vids)):
             new_vids[i]["duration"] = durations[i]
-    ranks = {sub.name: sub.rank for sub in subs}
     Q["fetch_time"] = new_fetch
     filters = {sub.name: sub.filter for sub in subs if sub.filter}
     def eval_filter(f: str, v: dict) -> bool:
+        v = copy.deepcopy(v)
         v["now"] = time.time()
-        return eval(f, copy.deepcopy(v))
-    videos = [v for v in filtered_old_vids + new_vids if v["channel"] not in filters or eval_filter(filters[v["channel"]], v)]
-    Q["videos"] = list(reversed(sorted(videos, key=lambda v:(ranks.get(v["channel"], 100), v["time"], v["channel"]))))
+        return eval(f, v)
+    filter_vids = lambda vs: [v for v in vs if v["channel"] not in filters or eval_filter(filters[v["channel"]], v)]
+    filtered_old_vids = filter_vids(filtered_old_vids)
+    filtered_new_vids = filter_vids(new_vids)
+    all_vids = filtered_old_vids + filtered_new_vids
+    async with aiohttp.ClientSession() as session:
+        _ = await sync_thumbnails(session, [id_from_url(v["link"]) for v in all_vids])
+    print(f"Added {len(filtered_new_vids)} videos to queue")
+    Q["videos"] = sort_vids(all_vids, subs)
     dump_queue(Q)
     print()
 
@@ -159,9 +175,9 @@ async def add_vid(args):
     Q = read_queue()
     async with aiohttp.ClientSession() as session:
         info = get_info(link)
-        await download_thumbnail(session, link)
+        await download_thumbnail(session, id_from_url(link))
     if info:
-        Q["videos"].insert(0, info)
+        Q["videos"] = sort_vids(Q["videos"] + [info], get_subs())
     dump_queue(Q)
 
 def list_videos():
@@ -190,7 +206,7 @@ def fzf_get_lines():
     fzf_lines.extend(get_entry_line(v, channel_width) for v in filtered)
     return "\n".join(fzf_lines)
 
-def fzf_get_lines_cmd(args):
+def fzf_get_lines_cmd(_):
     print(fzf_get_lines())
 
 async def play_queue():
@@ -213,7 +229,7 @@ async def play_queue():
         import textwrap
         space = " " * 37
         with ueberzug.Canvas() as c:
-            uz = c.create_placement('youtube-preview', x=0, y=1, max_height=8)
+            uz = c.create_placement('youtube-preview1', x=0, y=1, max_height=8)
             while True:
                 with open(_link_fifo) as link_fifo:
                     for link in link_fifo:
@@ -273,12 +289,11 @@ async def play_queue():
         if len(results) == 0:
             break
         key = results.pop(0)[:-1].decode("utf8")
-        for i, line in enumerate(results):
-            results[i] = line[:-1].split(b"\b")[1].decode("utf8")
+        rest = [line[:-1].split(b"\b")[1].decode("utf8") for line in results]
         if key == "del":
             Q = read_queue()
-            Q["videos"] = list(filter(lambda v:v["link"] not in results, Q["videos"]))
-            for link in results:
+            Q["videos"] = list(filter(lambda v:v["link"] not in rest, Q["videos"]))
+            for link in rest:
                 id = id_from_url(link)
                 rm_thumb(id)
             dump_queue(Q)
@@ -288,7 +303,7 @@ async def play_queue():
             await renew_queue()
         elif key == "ctrl-a":
             subs = get_subs()
-            for link in results:
+            for link in rest:
                 channel_id = list(filter(lambda v:v["link"] == link, read_queue()["videos"]))[0]["channel_id"]
                 for sub in subs:
                     if sub.id == channel_id:
@@ -297,7 +312,7 @@ async def play_queue():
             set_subs(subs)
         elif key == "ctrl-x":
             subs = get_subs()
-            for link in results:
+            for link in rest:
                 channel_id = list(filter(lambda v:v["link"] == link, read_queue()["videos"]))[0]["channel_id"]
                 for sub in subs:
                     if sub.id == channel_id:
@@ -307,17 +322,17 @@ async def play_queue():
         else:   # enter
             # os.system("tput rmcup")
             Q = read_queue()
-            print(f"Playing: {results[0]}")
+            print(f"Playing: {rest[0]}")
             cookies = os.path.expanduser("~/.config/youtube/cookie.txt")
-            vid = [v for v in Q["videos"] if v["link"] == results[0]][0]
-            sub = [s for s in get_subs() if s.id == vid["channel_id"]][0]
-            res = sub.res if sub.res != None else 1080
+            vid = [v for v in Q["videos"] if v["link"] == rest[0]][0]
+            sub = [s for s in get_subs() if s.id == vid["channel_id"]]
+            res = sub[0].res if len(sub) > 0 and sub[0].res != None else 1080
             proc = Popen(
                 [ "mpv"
                 , "--script-opts=ytdl_hook-ytdl_path=yt-dlp"
                 , f'--ytdl-format=bestvideo[height<={res}]+bestaudio/best[height<={res}]'
                 , f"--ytdl-raw-options=external-downloader=aria2c,throttled-rate=300k,cookies={cookies},mark-watched="
-                ] + results, stdout=None, stdin=DEVNULL)
+                ] + rest, stdout=None, stdin=DEVNULL)
             proc.wait()
             time.sleep(0.5)
     # os.system("tput rmcup")
@@ -325,7 +340,6 @@ async def play_queue():
     os.remove(preview_fifo)
 
 def watched_video(args):
-    # from glob import glob
     Q = read_queue()
     id = id_from_url(args.link)
     if id == None:
@@ -333,8 +347,6 @@ def watched_video(args):
     if args.finished:
         Q["videos"] = list(filter(lambda v:v["link"] != args.link, Q["videos"]))
         rm_thumb(id)
-        # for file in glob(f"{CONFIG_DIR}{id}.*"):
-        #     os.remove(file)
     else:
         if args.time != "":
             for i, video in enumerate(Q["videos"]):
@@ -346,7 +358,6 @@ def watched_video(args):
                 video["watched"] = int(float(args.time))
                 Q["videos"].insert(0, video)
     dump_queue(Q)
-    # pprint.pp(read_queue())
 
 async def sub_with_vid(args):
     from yt_dlp import YoutubeDL
@@ -363,7 +374,6 @@ async def main():
     await play_queue()
 
 if __name__ == "__main__":
-    import sys
     from argparse import ArgumentParser
     parser = ArgumentParser()
     parser.set_defaults(func=lambda _: asyncio.run(main()))
